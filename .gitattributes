@@ -1,0 +1,14 @@
+# Store and check out text as LF everywhere, including on Windows.
+#
+# Without this, core.autocrlf converts Go sources to CRLF on checkout and
+# `gofmt -l` then reports every file as unformatted, which would make the
+# lint gate fail for a Windows contributor but pass in CI.
+* text=auto eol=lf
+
+# Never transform these.
+*.png binary
+*.jpg binary
+*.gif binary
+*.ico binary
+*.gz  binary
+*.zip binary
