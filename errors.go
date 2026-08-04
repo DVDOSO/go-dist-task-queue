@@ -32,6 +32,16 @@ var (
 	// ErrClosed is returned by every method once the broker has been closed.
 	ErrClosed = errors.New("taskq: broker closed")
 
+	// ErrNoHandler is returned by a registry when no handler is registered for a
+	// job's task type.
+	//
+	// Treated as a normal retryable failure rather than sent straight to the
+	// dead-letter queue, because the usual cause is a rolling deploy where an
+	// old worker sees a task type only the new build knows about. Retrying lets
+	// that heal on its own; a job whose type is genuinely gone still reaches the
+	// dead-letter queue once its attempts run out.
+	ErrNoHandler = errors.New("taskq: no handler registered")
+
 	// ErrSkipRetry, when wrapped by a handler's returned error, sends the job
 	// straight to the dead-letter queue instead of consuming its remaining
 	// attempts. For failures that retrying cannot fix, such as a malformed
