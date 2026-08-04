@@ -1,0 +1,62 @@
+version: "2"
+
+run:
+  timeout: 5m
+  # Lint the integration-tagged files too, otherwise the Redis suite drifts unchecked.
+  build-tags:
+    - integration
+
+linters:
+  default: standard
+  enable:
+    - errorlint      # error comparison must survive wrapping
+    - gocritic
+    - gosec
+    - misspell
+    - nilerr         # returning nil after checking a non-nil error
+    - noctx          # network calls without a context
+    - revive
+    - sloglint       # this project standardises on log/slog
+    - unconvert
+    - unparam
+
+  settings:
+    errcheck:
+      check-type-assertions: true
+    gocritic:
+      enabled-tags:
+        - diagnostic
+        - style
+        - performance
+      disabled-checks:
+        - hugeParam       # fires on the Job envelope in hot paths; measured, not guessed
+    sloglint:
+      no-mixed-args: true
+      kv-only: false
+      attr-only: true     # slog.String("k", v), never "k", v
+      static-msg: true
+    revive:
+      rules:
+        - name: exported
+        - name: var-naming
+        - name: indent-error-flow
+        - name: errorf
+        - name: context-as-argument
+        - name: unexported-return
+
+  exclusions:
+    rules:
+      # Test helpers legitimately ignore Close errors and use weak randomness.
+      - path: _test\.go
+        linters:
+          - errcheck
+          - gosec
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/DVDOSO/go-dist-task-queue

@@ -1,0 +1,34 @@
+# Build output
+/bin/
+/dist/
+taskq
+taskq.exe
+
+# Test and profiling artifacts
+*.test
+*.test.exe
+*.out
+coverage.*
+cpu.prof
+mem.prof
+
+# Editor / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Local environment overrides
+.env
+.env.local
+
+# Claude Code: agent configuration, permissions, and working notes.
+# These are local scaffolding, not part of the library.
+.claude/
+CLAUDE.md
+CLAUDE.local.md
+.mcp.json
+
+# Planning and progress notes kept alongside the code but out of history.
+PLAN.md
+PROGRESS.md
