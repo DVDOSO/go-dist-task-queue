@@ -1,4 +1,4 @@
-# taskq
+# Distributed Task Queue in Go
 
 A distributed task queue for Go, backed by Redis. At-least-once delivery, visibility-timeout leases,
 retries with backoff, dead-lettering, cron scheduling with leader election, and weighted queue
@@ -35,7 +35,7 @@ srv.Run(ctx, mux) // drains gracefully when ctx is cancelled
 Reproducible from `examples/`. Intel Core Ultra 7 268V (8 cores), Redis 7.4.10 in Docker over
 loopback, every process on one machine.
 
-**Reliability** — `go run ./examples/chaos` spawns real worker *processes* and `SIGKILL`s one
+**Reliability** — `go run ./examples/chaos` spawns real worker _processes_ and `SIGKILL`s one
 mid-job. Over 5 runs of 300 jobs across 4 workers: **zero job loss**, zero duplicates, orphans
 recovered **2.17–2.64s** after the kill against a 3s bound (2s visibility timeout + 1s reap
 interval).
@@ -43,9 +43,9 @@ interval).
 **Throughput** — `go run ./examples/bench`, 5,000 jobs, 25 concurrency per worker, **no-op handler**
 so the figure is queue overhead rather than handler cost:
 
-| Worker processes | 1 | 2 | 4 | 8 |
-| --- | --- | --- | --- | --- |
-| Jobs/sec | ~1,400–1,900 | ~2,300–2,600 | ~2,700–3,600 | **~3,800 median** (3.3k–4.4k, 7 runs) |
+| Worker processes | 1            | 2            | 4            | 8                                     |
+| ---------------- | ------------ | ------------ | ------------ | ------------------------------------- |
+| Jobs/sec         | ~1,400–1,900 | ~2,300–2,600 | ~2,700–3,600 | **~3,800 median** (3.3k–4.4k, 7 runs) |
 
 Enqueue-to-start on an idle queue: **p50 2.6ms, p95 5.6ms, p99 6.8ms.**
 
@@ -59,7 +59,7 @@ leader partway through: **12 ticks, 12 distinct, 0 double fires** across the han
 ## The delivery contract
 
 > Every job that `Enqueue` returned `nil` for will be handed to a handler **at least once**, and is
-> not complete until a handler returns `nil` *and* the resulting `Ack` succeeds.
+> not complete until a handler returns `nil` _and_ the resulting `Ack` succeeds.
 
 Three consequences worth knowing before you build on it:
 
@@ -90,19 +90,19 @@ Three consequences worth knowing before you build on it:
 
 ## Redis layout
 
-There is no coordinator process. Redis *is* the coordination point, and every shared-state mutation
+There is no coordinator process. Redis _is_ the coordination point, and every shared-state mutation
 is a Lua script. Single-node or Sentinel; Cluster is not supported, because the global sorted sets
 and the per-queue keys would span hash slots.
 
-| Key | Type | Contents |
-| --- | --- | --- |
-| `taskq:q:<queue>` | LIST | ready job IDs |
-| `taskq:job:<id>` | HASH | the job envelope |
-| `taskq:active:<queue>` | ZSET | job ID → visibility deadline |
-| `taskq:delayed` / `:retry` / `:dead` | ZSET | job ID → run-at / retry-at / died-at |
-| `taskq:cron` | ZSET | schedule ID → next fire |
-| `taskq:workers` / `:worker:<id>` | ZSET / HASH+TTL | heartbeats and worker metadata |
-| `taskq:unique:<key>` / `:lease:<name>` | STRING NX PX | idempotency and leader election |
+| Key                                    | Type            | Contents                             |
+| -------------------------------------- | --------------- | ------------------------------------ |
+| `taskq:q:<queue>`                      | LIST            | ready job IDs                        |
+| `taskq:job:<id>`                       | HASH            | the job envelope                     |
+| `taskq:active:<queue>`                 | ZSET            | job ID → visibility deadline         |
+| `taskq:delayed` / `:retry` / `:dead`   | ZSET            | job ID → run-at / retry-at / died-at |
+| `taskq:cron`                           | ZSET            | schedule ID → next fire              |
+| `taskq:workers` / `:worker:<id>`       | ZSET / HASH+TTL | heartbeats and worker metadata       |
+| `taskq:unique:<key>` / `:lease:<name>` | STRING NX PX    | idempotency and leader election      |
 
 The active set being a ZSET scored by deadline is the whole reliability mechanism: "which jobs have
 lost their worker" is exactly `ZRANGEBYSCORE 0 now`.
@@ -122,7 +122,7 @@ since nothing would ack or nack it.
 
 **Jobs run on a context detached with `context.WithoutCancel`.** If handlers inherited cancellation,
 SIGTERM would kill every in-flight job instantly and "graceful shutdown" would mean nothing.
-Cancellation is the last resort after `ShutdownTimeout`. Ack and nack then use a *fresh* context,
+Cancellation is the last resort after `ShutdownTimeout`. Ack and nack then use a _fresh_ context,
 since the job's own may already be cancelled — reusing it would leave every in-flight lease dangling
 at shutdown.
 
@@ -130,7 +130,7 @@ at shutdown.
 claims are all compare-and-set: only the caller whose `ZREM` removed the member, or whose expected
 score still matched, goes on to act. N schedulers racing still fire each tick exactly once. The lease
 just stops fifty workers doing identical bookkeeping — which is why reaping and promotion run in
-*every* worker while cron is gated on leadership.
+_every_ worker while cron is gated on leadership.
 
 **Priority is a probability, not an ordering.** Queue order is reshuffled every poll in proportion to
 weights, so a queue weighted 6-of-10 leads about 60% of the time and nothing starves.
