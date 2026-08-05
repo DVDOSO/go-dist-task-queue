@@ -11,41 +11,7 @@ import (
 	"github.com/DVDOSO/go-dist-task-queue/internal/memory"
 )
 
-// brokerOnly hides everything but the hot path. Embedding the interface rather
-// than the concrete type means Maintenance and CronStore are not promoted, which
-// is how a broker without scheduling support looks to a Server.
-type brokerOnly struct{ taskq.Broker }
-
-// startServer runs a server in the background and returns a stop function.
-func startServer(t *testing.T, b taskq.Broker, cfg taskq.Config, h taskq.Handler) (srv *taskq.Server, stop func()) {
-	t.Helper()
-
-	srv, err := taskq.NewServer(b, cfg)
-	if err != nil {
-		t.Fatalf("NewServer: %v", err)
-	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		_ = srv.Run(ctx, h)
-	}()
-
-	var once sync.Once
-	stop = func() {
-		once.Do(func() {
-			cancel()
-			select {
-			case <-done:
-			case <-time.After(20 * time.Second):
-				t.Error("Run did not return after cancellation")
-			}
-		})
-	}
-	t.Cleanup(stop)
-	return srv, stop
-}
+// Cron scheduling and leader election.
 
 func cronConfig(entries ...taskq.CronEntry) taskq.Config {
 	cfg := quietConfig("default")
@@ -257,14 +223,4 @@ func TestLeadershipFailsOverOnShutdown(t *testing.T) {
 	waitFor(t, 15*time.Second, "a survivor to take over", func() bool {
 		return countLeaders(remaining) == 1
 	})
-}
-
-func countLeaders(servers []*taskq.Server) int {
-	n := 0
-	for _, s := range servers {
-		if s.IsLeader() {
-			n++
-		}
-	}
-	return n
 }

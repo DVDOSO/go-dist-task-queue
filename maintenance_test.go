@@ -3,7 +3,6 @@ package taskq_test
 import (
 	"context"
 	"errors"
-	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -11,6 +10,9 @@ import (
 	taskq "github.com/DVDOSO/go-dist-task-queue"
 	"github.com/DVDOSO/go-dist-task-queue/internal/memory"
 )
+
+// The background loops: lease renewal, orphan recovery, the retry cycle,
+// and heartbeats.
 
 // TestLeaseRenewalOutlivesTheVisibilityTimeout is the reason renewal exists: a
 // handler is allowed to run far longer than the visibility timeout, and must
@@ -277,69 +279,6 @@ func TestExhaustedRetriesReachTheDeadLetterQueue(t *testing.T) {
 
 	if n := attempts.Load(); n != 3 {
 		t.Errorf("handler ran %d times, want exactly the 3 attempts it was allowed", n)
-	}
-}
-
-// TestWeightedConsumption is the end-to-end version of the weighting policy:
-// with every queue kept full, the share of jobs consumed from each should track
-// its configured weight, and no queue should be starved out entirely.
-func TestWeightedConsumption(t *testing.T) {
-	t.Parallel()
-
-	b := memory.New()
-	client := taskq.NewClient(b)
-
-	var (
-		mu     sync.Mutex
-		counts = map[string]int{}
-		total  int
-	)
-	mux := taskq.NewMux()
-	mux.HandleFunc("work", func(_ context.Context, j *taskq.Job) error {
-		mu.Lock()
-		counts[j.Queue]++
-		total++
-		mu.Unlock()
-		return nil
-	})
-
-	// Deep enough that no queue drains before the sample is taken; otherwise
-	// the ratio would be measuring exhaustion rather than policy.
-	ctx := context.Background()
-	const perQueue = 4000
-	for _, q := range []string{"critical", "default", "low"} {
-		for range perQueue {
-			if _, err := client.EnqueueTask(ctx, "work", nil, taskq.Queue(q)); err != nil {
-				t.Fatalf("EnqueueTask: %v", err)
-			}
-		}
-	}
-
-	cfg := quietConfig("critical", "default", "low")
-	cfg.Weights = map[string]int{"critical": 6, "default": 3, "low": 1}
-	cfg.Concurrency = 1
-	runServer(t, b, cfg, mux)
-
-	const sample = 3000
-	waitFor(t, 30*time.Second, "enough jobs to measure a ratio", func() bool {
-		mu.Lock()
-		defer mu.Unlock()
-		return total >= sample
-	})
-
-	mu.Lock()
-	defer mu.Unlock()
-
-	want := map[string]float64{"critical": 0.6, "default": 0.3, "low": 0.1}
-	const tolerance = 0.05
-	for q, wantShare := range want {
-		got := float64(counts[q]) / float64(total)
-		if got < wantShare-tolerance || got > wantShare+tolerance {
-			t.Errorf("%s took %.1f%% of %d jobs, want ~%.0f%%", q, got*100, total, wantShare*100)
-		}
-	}
-	if counts["low"] == 0 {
-		t.Error("the low queue was starved entirely")
 	}
 }
 
