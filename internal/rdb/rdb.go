@@ -45,12 +45,17 @@ type Broker struct {
 	prefix       string
 	completedTTL time.Duration
 
-	enqueue *redis.Script
-	dequeue *redis.Script
-	ack     *redis.Script
-	nack    *redis.Script
-	kill    *redis.Script
-	extend  *redis.Script
+	enqueue      *redis.Script
+	dequeue      *redis.Script
+	ack          *redis.Script
+	nack         *redis.Script
+	kill         *redis.Script
+	extend       *redis.Script
+	reap         *redis.Script
+	promote      *redis.Script
+	heartbeat    *redis.Script
+	leaseAcquire *redis.Script
+	leaseRelease *redis.Script
 }
 
 // Option configures a Broker.
@@ -98,6 +103,11 @@ func New(client redis.UniversalClient, opts ...Option) (*Broker, error) {
 		{"nack", &b.nack},
 		{"kill", &b.kill},
 		{"extend", &b.extend},
+		{"reap", &b.reap},
+		{"promote", &b.promote},
+		{"heartbeat", &b.heartbeat},
+		{"lease_acquire", &b.leaseAcquire},
+		{"lease_release", &b.leaseRelease},
 	} {
 		s, err := loadScript(l.name)
 		if err != nil {
@@ -143,6 +153,9 @@ func (b *Broker) kDead() string             { return b.prefix + ":dead" }
 func (b *Broker) kQueues() string           { return b.prefix + ":queues" }
 func (b *Broker) kProcessed() string        { return b.prefix + ":stat:processed" }
 func (b *Broker) kFailed() string           { return b.prefix + ":stat:failed" }
+func (b *Broker) kWorkers() string          { return b.prefix + ":workers" }
+func (b *Broker) kWorker(id string) string  { return b.prefix + ":worker:" + id }
+func (b *Broker) kLease(name string) string { return b.prefix + ":lease:" + name }
 func (b *Broker) pJob() string              { return b.prefix + ":job:" }
 func (b *Broker) pActive() string           { return b.prefix + ":active:" }
 
