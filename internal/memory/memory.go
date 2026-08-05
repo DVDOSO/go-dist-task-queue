@@ -39,6 +39,9 @@ type Broker struct {
 	dead      []string // oldest first
 	queues    map[string]struct{}
 
+	// cron maps a schedule ID to its next fire time. Only the next fire is
+	// shared state; the schedule definitions live in the caller's code.
+	cron   map[string]time.Time
 	unique map[string]uniqueEntry
 	leases map[string]leaseEntry
 	// Stored by pointer: WorkerInfo is large enough that ranging over values
@@ -83,6 +86,7 @@ func New(opts ...Option) *Broker {
 		scheduled: make(map[string]time.Time),
 		retry:     make(map[string]time.Time),
 		queues:    make(map[string]struct{}),
+		cron:      make(map[string]time.Time),
 		unique:    make(map[string]uniqueEntry),
 		leases:    make(map[string]leaseEntry),
 		workers:   make(map[string]*workerEntry),

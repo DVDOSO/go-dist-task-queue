@@ -56,6 +56,7 @@ type Broker struct {
 	heartbeat    *redis.Script
 	leaseAcquire *redis.Script
 	leaseRelease *redis.Script
+	cronClaim    *redis.Script
 }
 
 // Option configures a Broker.
@@ -108,6 +109,7 @@ func New(client redis.UniversalClient, opts ...Option) (*Broker, error) {
 		{"heartbeat", &b.heartbeat},
 		{"lease_acquire", &b.leaseAcquire},
 		{"lease_release", &b.leaseRelease},
+		{"cron_claim", &b.cronClaim},
 	} {
 		s, err := loadScript(l.name)
 		if err != nil {
@@ -156,6 +158,7 @@ func (b *Broker) kFailed() string           { return b.prefix + ":stat:failed" }
 func (b *Broker) kWorkers() string          { return b.prefix + ":workers" }
 func (b *Broker) kWorker(id string) string  { return b.prefix + ":worker:" + id }
 func (b *Broker) kLease(name string) string { return b.prefix + ":lease:" + name }
+func (b *Broker) kCron() string             { return b.prefix + ":cron" }
 func (b *Broker) pJob() string              { return b.prefix + ":job:" }
 func (b *Broker) pActive() string           { return b.prefix + ":active:" }
 
