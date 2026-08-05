@@ -485,6 +485,10 @@ func TestServerConsumesMultipleQueuesInOrder(t *testing.T) {
 	// Serial, so the observed order is the fetch order rather than a race
 	// between concurrent workers.
 	cfg.Concurrency = 1
+	// Strict priority, because that is what an absolute ordering assertion is
+	// testing. The default is weighted-random, where "high before low" is a
+	// probability rather than a guarantee -- see TestWeightedConsumption.
+	cfg.StrictPriority = true
 	runServer(t, b, cfg, mux)
 
 	waitFor(t, 10*time.Second, "all six jobs to run", func() bool {

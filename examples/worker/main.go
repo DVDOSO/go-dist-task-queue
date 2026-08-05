@@ -16,12 +16,9 @@
 // Press Ctrl-C while it is working to watch the drain: in-flight jobs finish,
 // no new ones start, and the process exits cleanly.
 //
-// # What this demo cannot show yet
-//
-// A job that fails is nacked into the retry set with a backoff, and stays
-// there: promoting due jobs back onto their queue is the scheduler's job, and
-// the scheduler arrives in stage 5. So "retried" below means "correctly
-// scheduled for a retry that nothing has come back for yet", not "ran again".
+// The full retry cycle runs here: a failing job is nacked into the retry set
+// with a backoff, promoted back onto its queue when that backoff elapses, and
+// run again. The "charge:card" handler fails twice before succeeding.
 package main
 
 import (
@@ -111,11 +108,15 @@ func run() error {
 		return nil
 	})
 
-	// A job that fails, to show the retry decision and the computed backoff.
-	mux.HandleFunc("charge:card", func(context.Context, *taskq.Job) error {
-		out.retried.Add(1)
+	// Fails twice, then succeeds, to show backoff and the full retry cycle.
+	mux.HandleFunc("charge:card", func(_ context.Context, j *taskq.Job) error {
+		if j.Attempt < 3 {
+			out.retried.Add(1)
+			return errors.New("payment gateway timeout")
+		}
+		out.succeeded.Add(1)
 		out.settle()
-		return errors.New("payment gateway timeout")
+		return nil
 	})
 
 	// A job that can never succeed, to show the dead-letter path skipping the
@@ -127,11 +128,15 @@ func run() error {
 	})
 
 	srv, err := taskq.NewServer(broker, taskq.Config{
-		Queues:            []string{"critical", "default"},
+		Queues: []string{"critical", "default"},
+		// Weighted rather than strict: critical is tried first on roughly 80%
+		// of polls, but default still makes progress instead of starving while
+		// critical has work.
+		Weights:           map[string]int{"critical": 4, "default": 1},
 		Concurrency:       concurrency,
 		VisibilityTimeout: 30 * time.Second,
 		ShutdownTimeout:   10 * time.Second,
-		Backoff:           &taskq.Exponential{Base: time.Second, Cap: time.Minute, Jitter: taskq.JitterFull},
+		Backoff:           &taskq.Exponential{Base: 100 * time.Millisecond, Cap: time.Second, Jitter: taskq.JitterFull},
 		Logger:            log,
 	})
 	if err != nil {
@@ -165,8 +170,7 @@ func run() error {
 	fmt.Printf("\n--- summary ---\n")
 	fmt.Printf("succeeded     : %d\n", out.succeeded.Load())
 	fmt.Printf("dead-lettered : %d  (ErrSkipRetry, budget untouched)\n", out.deadLettered.Load())
-	fmt.Printf("retried       : %d  (waiting in the retry set; the scheduler that\n", out.retried.Load())
-	fmt.Printf("                     promotes them back arrives in stage 5)\n")
+	fmt.Printf("retries       : %d  (nacked, backed off, promoted, and re-run)\n", out.retried.Load())
 	fmt.Printf("elapsed       : %s\n", elapsed.Round(time.Millisecond))
 	if runErr != nil {
 		fmt.Printf("shutdown      : %v\n", runErr)

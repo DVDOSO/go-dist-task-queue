@@ -54,8 +54,30 @@ const (
 
 // Config configures a [Server].
 type Config struct {
-	// Queues to consume, in the order they should be tried. Required.
+	// Queues to consume. Required.
+	//
+	// With StrictPriority they are tried in this order; otherwise the order is
+	// reshuffled on every poll according to Weights.
 	Queues []string
+
+	// Weights biases which queue is tried first, keyed by queue name. A queue
+	// with no entry weighs 1, so naming a weight for one queue does not
+	// silently zero the others.
+	//
+	// With weights {critical: 6, default: 3, low: 1}, the critical queue is
+	// tried first on roughly 60% of polls. Every queue keeps a non-zero share,
+	// which is what stops a saturated high-priority queue from starving the
+	// others outright.
+	Weights map[string]int
+
+	// StrictPriority tries queues in the configured order every time, ignoring
+	// Weights.
+	//
+	// Off by default because it starves: while a high-priority queue has work,
+	// nothing below it runs at all. Available because some workloads genuinely
+	// want that, and it is better to opt into starvation knowingly than to
+	// approximate it with lopsided weights.
+	StrictPriority bool
 
 	// Concurrency is the maximum number of jobs running at once. Defaults to
 	// DefaultConcurrency.
@@ -113,6 +135,8 @@ type Server struct {
 	log  *slog.Logger
 	host string
 
+	// queues decides which order to try the queues in on each poll.
+	queues *queueSelector
 	// entries holds the parsed schedules, keyed by entry ID.
 	entries map[string]*compiledEntry
 	// leader records whether this worker currently holds the scheduler lease,
@@ -134,9 +158,22 @@ func NewServer(b Broker, cfg Config) (*Server, error) {
 	if len(cfg.Queues) == 0 {
 		return nil, errors.New("taskq: Config.Queues must name at least one queue")
 	}
+	seenQueue := make(map[string]struct{}, len(cfg.Queues))
 	for _, q := range cfg.Queues {
 		if q == "" {
 			return nil, errors.New("taskq: Config.Queues contains an empty queue name")
+		}
+		if _, dup := seenQueue[q]; dup {
+			return nil, fmt.Errorf("taskq: Config.Queues lists %q twice", q)
+		}
+		seenQueue[q] = struct{}{}
+	}
+	for name, w := range cfg.Weights {
+		if _, known := seenQueue[name]; !known {
+			return nil, fmt.Errorf("taskq: Config.Weights names %q, which is not in Config.Queues", name)
+		}
+		if w < 1 {
+			return nil, fmt.Errorf("taskq: Config.Weights[%q] = %d, must be at least 1", name, w)
 		}
 	}
 
@@ -184,6 +221,7 @@ func NewServer(b Broker, cfg Config) (*Server, error) {
 		log:      cfg.Logger.With(slog.String("worker_id", cfg.WorkerID)),
 		host:     host,
 		inFlight: make(map[string]context.CancelFunc),
+		queues:   newQueueSelector(cfg.Queues, cfg.Weights, cfg.StrictPriority),
 		entries:  entries,
 	}
 	// Optional rather than required: a broker that only implements the hot path
@@ -250,6 +288,7 @@ func (s *Server) Run(ctx context.Context, h Handler) error {
 
 	s.log.Info("worker started",
 		slog.Any("queues", s.cfg.Queues),
+		slog.Bool("strict_priority", s.cfg.StrictPriority),
 		slog.Int("concurrency", s.cfg.Concurrency),
 		slog.Duration("visibility_timeout", s.cfg.VisibilityTimeout),
 		slog.Bool("maintenance", s.maint != nil))
@@ -636,9 +675,11 @@ func (s *Server) fetchLoop(ctx, jobCtx context.Context, h Handler, slots chan st
 		case slots <- struct{}{}:
 		}
 
+		// Reshuffled per poll, so priority is expressed as a probability of
+		// being tried first rather than as an absolute ordering.
 		job, err := s.broker.Dequeue(ctx, ClaimOpts{
 			WorkerID:          s.cfg.WorkerID,
-			Queues:            s.cfg.Queues,
+			Queues:            s.queues.next(),
 			VisibilityTimeout: s.cfg.VisibilityTimeout,
 		})
 
