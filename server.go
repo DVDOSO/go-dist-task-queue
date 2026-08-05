@@ -31,6 +31,15 @@ const (
 	// Grace period after cancelling in-flight jobs at the shutdown deadline,
 	// so their nacks have a chance to land before the process exits.
 	forceGracePeriod = 5 * time.Second
+
+	// Consecutive lease-renewal failures tolerated before a worker gives up and
+	// cancels its own in-flight jobs.
+	maxRenewFailures = 3
+
+	// Per-call ceilings on the background maintenance loops, so one sweep of a
+	// large backlog cannot monopolise a Redis event loop.
+	reapBatch    = 100
+	promoteBatch = 100
 )
 
 // Config configures a [Server].
@@ -43,8 +52,15 @@ type Config struct {
 	Concurrency int
 
 	// VisibilityTimeout is how long a claim is valid before the job becomes
-	// eligible for re-delivery. Until lease renewal exists, a handler that runs
-	// longer than this will have its job re-delivered while it is still going.
+	// eligible for re-delivery.
+	//
+	// It is also the knob the maintenance loops are derived from: leases are
+	// renewed every VisibilityTimeout/3 and expired ones reaped every
+	// VisibilityTimeout/2, so worst-case recovery after a worker dies is
+	// roughly one and a half times this value.
+	//
+	// A handler may run far longer than this: renewal keeps extending the lease
+	// for as long as the worker is alive.
 	VisibilityTimeout time.Duration
 
 	// ShutdownTimeout is how long a graceful shutdown waits for in-flight jobs
@@ -63,11 +79,22 @@ type Config struct {
 }
 
 // Server is the worker runtime: it claims jobs, runs them through a handler,
-// and reports the outcome.
+// renews their leases, and reports the outcome.
 type Server struct {
 	broker Broker
-	cfg    Config
-	log    *slog.Logger
+	// maint is non-nil when the broker also implements Maintenance, which is
+	// what enables orphan recovery, retry promotion, and heartbeats.
+	maint Maintenance
+
+	cfg  Config
+	log  *slog.Logger
+	host string
+
+	// mu guards inFlight, which maps a running job's ID to the cancel function
+	// for its individual context. Per-job cancellation is what lets a single
+	// lost lease stop one job without disturbing the others.
+	mu       sync.Mutex
+	inFlight map[string]context.CancelFunc
 }
 
 // NewServer validates a configuration and returns a worker.
@@ -103,11 +130,25 @@ func NewServer(b Broker, cfg Config) (*Server, error) {
 		cfg.Logger = slog.Default()
 	}
 
-	return &Server{
-		broker: b,
-		cfg:    cfg,
-		log:    cfg.Logger.With(slog.String("worker_id", cfg.WorkerID)),
-	}, nil
+	host, err := os.Hostname()
+	if err != nil || host == "" {
+		host = "unknown"
+	}
+
+	s := &Server{
+		broker:   b,
+		cfg:      cfg,
+		log:      cfg.Logger.With(slog.String("worker_id", cfg.WorkerID)),
+		host:     host,
+		inFlight: make(map[string]context.CancelFunc),
+	}
+	// Optional rather than required: a broker that only implements the hot path
+	// is still usable, it just cannot recover orphans. Saying so at startup
+	// beats silently running without a safety net.
+	if m, ok := b.(Maintenance); ok {
+		s.maint = m
+	}
+	return s, nil
 }
 
 // WorkerID returns this server's identity, which is also the owner stamped on
@@ -118,12 +159,9 @@ func (s *Server) WorkerID() string { return s.cfg.WorkerID }
 //
 // Cancelling ctx does not cancel jobs that are already running. It stops new
 // claims and starts draining: in-flight handlers get up to ShutdownTimeout to
-// finish normally. Only if that expires are they cancelled, and even then their
-// failures are reported so the jobs retry promptly instead of waiting out a
-// visibility timeout.
-//
-// Returns nil on a clean drain, or an error if jobs were still running after
-// the deadline and the grace period.
+// finish normally, with their leases still being renewed throughout. Only if
+// that expires are they cancelled, and even then their failures are reported so
+// the jobs retry promptly instead of waiting out a visibility timeout.
 func (s *Server) Run(ctx context.Context, h Handler) error {
 	if h == nil {
 		return errors.New("taskq: nil handler")
@@ -131,25 +169,220 @@ func (s *Server) Run(ctx context.Context, h Handler) error {
 
 	// Jobs deliberately do not inherit cancellation from ctx. If they did,
 	// SIGTERM would kill every in-flight handler instantly and "graceful
-	// shutdown" would mean nothing. Instead they get a detached context that
-	// this function holds the only cancel for, used as a last resort.
+	// shutdown" would mean nothing.
 	jobCtx, cancelJobs := context.WithCancel(context.WithoutCancel(ctx))
 	defer cancelJobs()
+
+	// Lease renewal and heartbeats must outlive ctx too: a job draining for
+	// twenty seconds still needs its lease extended, or it gets reaped and
+	// duplicated by another worker while it is busy finishing.
+	maintCtx, stopMaint := context.WithCancel(context.WithoutCancel(ctx))
+	defer stopMaint()
+
+	started := time.Now()
+	var maintWG sync.WaitGroup
+	s.startMaintenance(ctx, maintCtx, started, &maintWG)
 
 	// A buffered channel is the whole concurrency limiter: one slot per
 	// permitted in-flight job.
 	slots := make(chan struct{}, s.cfg.Concurrency)
-	var wg sync.WaitGroup
+	var jobWG sync.WaitGroup
 
 	s.log.Info("worker started",
 		slog.Any("queues", s.cfg.Queues),
 		slog.Int("concurrency", s.cfg.Concurrency),
-		slog.Duration("visibility_timeout", s.cfg.VisibilityTimeout))
+		slog.Duration("visibility_timeout", s.cfg.VisibilityTimeout),
+		slog.Bool("maintenance", s.maint != nil))
 
-	s.fetchLoop(ctx, jobCtx, h, slots, &wg)
+	s.fetchLoop(ctx, jobCtx, h, slots, &jobWG)
 
 	s.log.Info("worker draining", slog.Duration("shutdown_timeout", s.cfg.ShutdownTimeout))
-	return s.drain(&wg, cancelJobs)
+	err := s.drain(&jobWG, cancelJobs)
+
+	stopMaint()
+	maintWG.Wait()
+	return err
+}
+
+// startMaintenance launches the background loops.
+//
+// runCtx stops at shutdown; maintCtx outlives it so that draining jobs keep
+// their leases. Reaping and promoting are other workers' problem once this one
+// is going away, but renewal and heartbeats are not.
+func (s *Server) startMaintenance(runCtx, maintCtx context.Context, started time.Time, wg *sync.WaitGroup) {
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		s.renewLoop(maintCtx)
+	}()
+
+	if s.maint == nil {
+		s.log.Warn("orphan recovery disabled: broker does not implement taskq.Maintenance")
+		return
+	}
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		s.heartbeatLoop(maintCtx, started)
+	}()
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		s.reapLoop(runCtx)
+	}()
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		s.promoteLoop(runCtx)
+	}()
+}
+
+// renewLoop extends the leases of every in-flight job.
+//
+// One batched call for the whole pool rather than one per job: at a renewal
+// interval of a third of the visibility timeout, per-job renewals would put a
+// worker's lease traffic in the same order of magnitude as its actual work.
+func (s *Server) renewLoop(ctx context.Context) {
+	interval := s.cfg.VisibilityTimeout / 3
+	if interval <= 0 {
+		interval = time.Second
+	}
+
+	failures := 0
+	for {
+		if !sleepCtx(ctx, interval) {
+			return
+		}
+
+		ids := s.inFlightIDs()
+		if len(ids) == 0 {
+			failures = 0
+			continue
+		}
+
+		lost, err := s.broker.Extend(ctx, s.cfg.WorkerID, ids, s.cfg.VisibilityTimeout)
+		if err != nil {
+			failures++
+			s.log.Error("lease renewal failed",
+				slog.Int("in_flight", len(ids)),
+				slog.Int("consecutive_failures", failures),
+				slog.String("error", err.Error()))
+
+			// Repeated failure almost certainly means the broker is
+			// unreachable and every lease has expired. Continuing to run burns
+			// capacity on work that is already being redone elsewhere, so stop
+			// and let the retry path handle it. A false positive here costs one
+			// wasted attempt; a false negative costs duplicated side effects.
+			if failures >= maxRenewFailures {
+				s.log.Error("giving up on lease renewal, cancelling in-flight jobs",
+					slog.Int("in_flight", len(ids)))
+				for _, id := range ids {
+					s.cancelJob(id)
+				}
+				failures = 0
+			}
+			continue
+		}
+		failures = 0
+
+		for _, id := range lost {
+			// Someone else owns this job now. Whatever this handler does from
+			// here is duplicate work at best.
+			s.log.Warn("lease lost, cancelling job", slog.String("job_id", id))
+			s.cancelJob(id)
+		}
+	}
+}
+
+// reapLoop recovers jobs whose leases expired.
+//
+// Every worker runs this, not just an elected leader. Reaping is idempotent --
+// the broker guarantees only one caller acts on a given job -- so redundancy is
+// free, and it keeps orphan recovery off the critical path of leader election.
+func (s *Server) reapLoop(ctx context.Context) {
+	interval := s.cfg.VisibilityTimeout / 2
+	if interval <= 0 {
+		interval = time.Second
+	}
+
+	for {
+		// Jittered so a fleet that started together does not sweep in lockstep.
+		if !sleepCtx(ctx, jitter(interval)) {
+			return
+		}
+
+		n, err := s.maint.Reap(ctx, s.cfg.Queues, reapBatch)
+		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			s.log.Error("reap failed", slog.String("error", err.Error()))
+			continue
+		}
+		if n > 0 {
+			s.log.Warn("recovered orphaned jobs", slog.Int("count", n))
+		}
+	}
+}
+
+// promoteLoop moves due retries and delayed jobs onto their ready queues.
+func (s *Server) promoteLoop(ctx context.Context) {
+	interval := min(time.Second, s.cfg.VisibilityTimeout/2)
+	if interval <= 0 {
+		interval = time.Second
+	}
+
+	for {
+		if !sleepCtx(ctx, jitter(interval)) {
+			return
+		}
+
+		n, err := s.maint.Promote(ctx, promoteBatch)
+		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			s.log.Error("promote failed", slog.String("error", err.Error()))
+			continue
+		}
+		if n > 0 {
+			s.log.Debug("promoted due jobs", slog.Int("count", n))
+		}
+	}
+}
+
+// heartbeatLoop publishes this worker's liveness and load.
+func (s *Server) heartbeatLoop(ctx context.Context, started time.Time) {
+	interval := min(5*time.Second, s.cfg.VisibilityTimeout/2)
+	if interval <= 0 {
+		interval = time.Second
+	}
+	// Three missed beats before a worker is presumed gone, so one slow round
+	// trip does not make a healthy worker vanish from the operator's view.
+	ttl := 3 * interval
+
+	beat := func() {
+		if err := s.maint.Heartbeat(ctx, WorkerInfo{
+			ID:          s.cfg.WorkerID,
+			Host:        s.host,
+			PID:         os.Getpid(),
+			Queues:      s.cfg.Queues,
+			Concurrency: s.cfg.Concurrency,
+			InFlight:    s.inFlightCount(),
+			StartedAt:   started,
+		}, ttl); err != nil && ctx.Err() == nil {
+			s.log.Error("heartbeat failed", slog.String("error", err.Error()))
+		}
+	}
+
+	beat() // register immediately rather than after the first interval
+	for {
+		if !sleepCtx(ctx, interval) {
+			return
+		}
+		beat()
+	}
 }
 
 // fetchLoop claims work until ctx is cancelled.
@@ -208,16 +441,25 @@ func (s *Server) fetchLoop(ctx, jobCtx context.Context, h Handler, slots chan st
 
 // runJob executes one job and reports the outcome.
 func (s *Server) runJob(ctx context.Context, h Handler, j *Job) {
+	// Each job gets its own cancellable context so that losing one lease stops
+	// exactly one handler.
+	jobCtx, cancel := context.WithCancel(ctx)
+	s.trackJob(j.ID, cancel)
+	defer func() {
+		s.untrackJob(j.ID)
+		cancel()
+	}()
+
 	start := time.Now()
-	err := s.invoke(ctx, h, j)
+	err := s.invoke(jobCtx, h, j)
 	elapsed := time.Since(start)
 
 	// The outcome must be reported even when the job's own context has been
 	// cancelled, so this gets a fresh one. Reusing the cancelled context would
 	// mean a shutdown left every in-flight job's lease dangling until the
 	// reaper noticed -- turning a clean stop into a pile of duplicate work.
-	reportCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), reportTimeout)
-	defer cancel()
+	reportCtx, cancelReport := context.WithTimeout(context.WithoutCancel(ctx), reportTimeout)
+	defer cancelReport()
 
 	switch {
 	case err == nil:
@@ -250,7 +492,13 @@ func (s *Server) runJob(ctx context.Context, h Handler, j *Job) {
 		delay := s.cfg.Backoff.Next(j.Attempt)
 		retryAt := time.Now().Add(delay)
 		if nackErr := s.broker.Nack(reportCtx, s.cfg.WorkerID, j.ID, retryAt, err.Error()); nackErr != nil {
-			s.log.Error("nack failed",
+			// ErrLeaseLost here is expected and benign: the job was already
+			// re-delivered, so someone else owns its outcome.
+			level := slog.LevelError
+			if errors.Is(nackErr, ErrLeaseLost) {
+				level = slog.LevelWarn
+			}
+			s.log.Log(reportCtx, level, "nack failed",
 				slog.String("job_id", j.ID),
 				slog.String("error", nackErr.Error()))
 			return
@@ -320,6 +568,46 @@ func (s *Server) drain(wg *sync.WaitGroup, cancelJobs func()) error {
 	}
 }
 
+// trackJob records a running job so its lease can be renewed and, if lost,
+// cancelled.
+func (s *Server) trackJob(id string, cancel context.CancelFunc) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.inFlight[id] = cancel
+}
+
+func (s *Server) untrackJob(id string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.inFlight, id)
+}
+
+func (s *Server) inFlightIDs() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	ids := make([]string, 0, len(s.inFlight))
+	for id := range s.inFlight {
+		ids = append(ids, id)
+	}
+	return ids
+}
+
+func (s *Server) inFlightCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.inFlight)
+}
+
+// cancelJob stops one running job without disturbing the others.
+func (s *Server) cancelJob(id string) {
+	s.mu.Lock()
+	cancel, ok := s.inFlight[id]
+	s.mu.Unlock()
+	if ok {
+		cancel()
+	}
+}
+
 // sleepCtx waits for d, reporting false if ctx was cancelled first.
 func sleepCtx(ctx context.Context, d time.Duration) bool {
 	t := time.NewTimer(d)
@@ -332,14 +620,14 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 	}
 }
 
-// jitter spreads a poll interval over [d/2, d) so workers that started together
-// do not settle into synchronised polling.
+// jitter spreads an interval over [d/2, d) so workers that started together do
+// not settle into synchronised polling or sweeping.
 func jitter(d time.Duration) time.Duration {
 	if d <= 1 {
 		return d
 	}
 	half := d / 2
-	return half + time.Duration(rand.Int64N(int64(half))) //nolint:gosec // G404: poll spacing, not security
+	return half + time.Duration(rand.Int64N(int64(half))) //nolint:gosec // G404: interval spacing, not security
 }
 
 // generateWorkerID builds an identifier that is unique across processes and
