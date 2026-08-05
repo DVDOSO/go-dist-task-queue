@@ -17,7 +17,7 @@ mux := taskq.NewMux()
 mux.HandleFunc("email:send", func(ctx context.Context, j *taskq.Job) error {
     var e Email
     if err := json.Unmarshal(j.Payload, &e); err != nil {
-        return fmt.Errorf("bad payload: %w", taskq.ErrSkipRetry)
+        return fmt.Errorf("bad payload: %w", taskq.ErrSkipRetry) // straight to the dead-letter queue
     }
     return send(ctx, e)
 })
@@ -30,73 +30,46 @@ srv, _ := taskq.NewServer(broker, taskq.Config{
 srv.Run(ctx, mux) // drains gracefully when ctx is cancelled
 ```
 
----
+## Measured
 
-## Measured results
+Reproducible from `examples/`. Intel Core Ultra 7 268V (8 cores), Redis 7.4.10 in Docker over
+loopback, every process on one machine.
 
-All reproducible from `examples/`. Hardware: Intel Core Ultra 7 268V (8 cores), 31.5 GB RAM,
-Windows 11, Redis 7.4.10 in Docker over loopback, every process on one machine.
+**Reliability** — `go run ./examples/chaos` spawns real worker *processes* and `SIGKILL`s one
+mid-job. Over 5 runs of 300 jobs across 4 workers: **zero job loss**, zero duplicates, orphans
+recovered **2.17–2.64s** after the kill against a 3s bound (2s visibility timeout + 1s reap
+interval).
 
-### Reliability — `go run ./examples/chaos`
+**Throughput** — `go run ./examples/bench`, 5,000 jobs, 25 concurrency per worker, **no-op handler**
+so the figure is queue overhead rather than handler cost:
 
-Spawns real worker **processes**, `SIGKILL`s one mid-job, and checks every job still completed. A
-worker killed this way never acks, never nacks, and never releases its leases.
+| Worker processes | 1 | 2 | 4 | 8 |
+| --- | --- | --- | --- | --- |
+| Jobs/sec | ~1,400–1,900 | ~2,300–2,600 | ~2,700–3,600 | **~3,800 median** (3.3k–4.4k, 7 runs) |
 
-| Metric | Result (5 runs) |
-| --- | --- |
-| Jobs enqueued | 300, across 4 worker processes |
-| **Jobs lost** | **0, every run** |
-| Duplicate executions | 0, every run |
-| Orphans recovered after the kill | 2.17s – 2.64s |
-| Theoretical bound | 3s = 2s visibility timeout + 1s reap interval |
+Enqueue-to-start on an idle queue: **p50 2.6ms, p95 5.6ms, p99 6.8ms.**
 
-### Throughput — `go run ./examples/bench`
+Scaling is sublinear — about 2.7× for 8× the workers. One Redis serialises every state transition at
+three round trips per job, and nine processes share eight cores. Getting past that means sharding by
+queue across Redis instances.
 
-5,000 jobs per run, 25 concurrency per worker process, **no-op handler** — this measures the queue's
-own overhead (enqueue, claim, ack), not handler cost.
-
-| Worker processes | End-to-end jobs/sec |
-| --- | --- |
-| 1 | ~1,400 – 1,900 |
-| 2 | ~2,300 – 2,600 |
-| 4 | ~2,700 – 3,600 |
-| **8** | **~3,800 median** (3,331 – 4,405 across 7 runs) |
-
-Enqueue-to-start latency, onto an **idle** queue: **p50 2.6ms, p95 5.6ms, p99 6.8ms.**
-
-**Scaling is sublinear — about 2.7× for 8× the workers.** Two reasons, both properties of the rig
-rather than the design: one Redis instance serialises every state transition at three round trips per
-job, and nine processes share eight cores. Scaling past this means sharding by queue across Redis
-instances, or moving to a broker with partitions.
-
-### Scheduling — `go run ./examples/scheduled`
-
-Three workers share one schedule; the current leader is stopped partway through.
-
-**12 ticks fired, 12 distinct, 0 double fires** across the handover — on both the Redis and in-memory
-brokers.
-
----
+**Scheduling** — `go run ./examples/scheduled` runs three workers over one schedule and stops the
+leader partway through: **12 ticks, 12 distinct, 0 double fires** across the handover.
 
 ## The delivery contract
 
-> Every job that `Enqueue` returned `nil` for will be handed to a registered handler **at least
-> once**, and is not considered complete until a handler returns `nil` *and* the resulting `Ack`
-> succeeds.
+> Every job that `Enqueue` returned `nil` for will be handed to a handler **at least once**, and is
+> not complete until a handler returns `nil` *and* the resulting `Ack` succeeds.
 
-Four corollaries, stated plainly because each one is a real constraint:
+Three consequences worth knowing before you build on it:
 
-1. **Duplicates are possible and are not a bug.** If a worker stalls past its visibility deadline,
-   the reaper re-delivers the job while the original may still be running. **Handlers must be
-   idempotent.** There is no exactly-once mode.
-2. **An `Enqueue` error is ambiguous.** A timed-out round trip may mean the job landed or did not.
-   Producers that care should pass `taskq.Unique(key, ttl)` and treat `ErrDuplicate` as success.
-3. **The guarantee is conditional on Redis durability.** With `appendfsync everysec` you can lose up
-   to a second of acknowledged enqueues on an unclean shutdown.
-4. **Poison pills terminate.** Attempts are consumed at claim time, so a job that reliably crashes
+1. **Duplicates are possible and are not a bug.** If a worker stalls past its visibility deadline the
+   reaper re-delivers while the original may still be running. **Handlers must be idempotent.** There
+   is no exactly-once mode.
+2. **An `Enqueue` error is ambiguous** — a timed-out round trip may mean the job landed or did not.
+   Pass `taskq.Unique(key, ttl)` and treat `ErrDuplicate` as success.
+3. **Poison pills terminate.** Attempts are consumed at claim time, so a job that reliably crashes
    its worker reaches the dead-letter queue instead of cycling forever.
-
-### Job lifecycle
 
 ```
                     Enqueue(RunAt>now)          promote (leader-elected)
@@ -115,61 +88,33 @@ Four corollaries, stated plainly because each one is a real constraint:
                                                             dead ◄───────────────────┘
 ```
 
----
-
-## Architecture
-
-```
-┌────────────┐   Enqueue / EnqueueTask       ┌──────────────────────────────┐
-│ Producer   │ ────────────────────────────► │            Redis             │
-└────────────┘                               │                              │
-                                             │  lists  : ready queues       │
-┌────────────┐   Dequeue → run → Ack/Nack    │  zsets  : active / delayed / │
-│ Worker     │ ◄───────────────────────────► │           retry / dead /     │
-│  ├ pool    │   Extend  (lease renewal)     │           workers / cron     │
-│  ├ reaper  │   Reap    (orphan recovery)   │  hashes : job envelopes      │
-│  ├ promoter│   Promote (retries + delayed) │  strings: unique keys, leases│
-│  └ schedulr│   Cron    (leader only)       │                              │
-└────────────┘                               └──────────────────────────────┘
-```
+## Redis layout
 
 There is no coordinator process. Redis *is* the coordination point, and every shared-state mutation
-is a Lua script.
-
-### Redis key layout
+is a Lua script. Single-node or Sentinel; Cluster is not supported, because the global sorted sets
+and the per-queue keys would span hash slots.
 
 | Key | Type | Contents |
 | --- | --- | --- |
-| `taskq:q:<queue>` | LIST | ready job IDs; `RPUSH` to enqueue, `LPOP` to claim |
-| `taskq:job:<id>` | HASH | the job envelope; fields mutated individually from Lua |
-| `taskq:active:<queue>` | ZSET | job ID → visibility deadline (unix ms) |
-| `taskq:delayed` | ZSET | job ID → run-at |
-| `taskq:retry` | ZSET | job ID → retry-at |
-| `taskq:dead` | ZSET | job ID → died-at |
+| `taskq:q:<queue>` | LIST | ready job IDs |
+| `taskq:job:<id>` | HASH | the job envelope |
+| `taskq:active:<queue>` | ZSET | job ID → visibility deadline |
+| `taskq:delayed` / `:retry` / `:dead` | ZSET | job ID → run-at / retry-at / died-at |
 | `taskq:cron` | ZSET | schedule ID → next fire |
-| `taskq:workers` | ZSET | worker ID → last heartbeat |
-| `taskq:worker:<id>` | HASH + TTL | self-expiring worker metadata |
-| `taskq:unique:<key>` | STRING NX PX | idempotency lock |
-| `taskq:lease:<name>` | STRING NX PX | leader election |
-| `taskq:queues` | SET | known queue names, so nothing ever runs `KEYS` |
-| `taskq:stat:{processed,failed}` | counter | durable totals across restarts |
+| `taskq:workers` / `:worker:<id>` | ZSET / HASH+TTL | heartbeats and worker metadata |
+| `taskq:unique:<key>` / `:lease:<name>` | STRING NX PX | idempotency and leader election |
 
 The active set being a ZSET scored by deadline is the whole reliability mechanism: "which jobs have
 lost their worker" is exactly `ZRANGEBYSCORE 0 now`.
 
----
-
 ## Design decisions
 
-**Attempts are consumed at claim time, not at failure time.** A worker that is `SIGKILL`ed never
-reports a failure, so a failure-counting scheme would let a job that reliably crashes its worker
-cycle forever. Counting claims bounds poison pills without a second ceiling to reason about. The
-`Recoveries` field survives as pure observability — it is what tells you, from a dead-letter entry,
-whether a job was *failing* or *killing workers*.
+**Attempts are consumed at claim time, not at failure time.** A `SIGKILL`ed worker never reports a
+failure, so a failure-counting scheme would let a job that reliably crashes its worker cycle forever.
 
-**All time comes from the Redis server, never from a worker.** Lease deadlines are compared across
+**All time comes from the Redis server, never a worker.** Lease deadlines are compared across
 machines, so one client with a skewed clock must not be able to grant itself extra runtime or expire
-its own lease on arrival. Every script reads `TIME`.
+its own lease on arrival.
 
 **Concurrency slots are taken before claiming, not after.** Claiming a job with no capacity to run it
 means holding a lease on work sitting in a local buffer — and losing it outright if the process dies,
@@ -177,62 +122,29 @@ since nothing would ack or nack it.
 
 **Jobs run on a context detached with `context.WithoutCancel`.** If handlers inherited cancellation,
 SIGTERM would kill every in-flight job instantly and "graceful shutdown" would mean nothing.
-Cancellation is the last resort after `ShutdownTimeout`, and even then the failures are reported so
-jobs retry promptly instead of waiting out a visibility timeout.
-
-**Ack and nack use a fresh context.** The job's own context may already be cancelled; reusing it
-would leave every in-flight lease dangling at shutdown, turning a clean stop into duplicate work.
+Cancellation is the last resort after `ShutdownTimeout`. Ack and nack then use a *fresh* context,
+since the job's own may already be cancelled — reusing it would leave every in-flight lease dangling
+at shutdown.
 
 **Leader election is an efficiency measure, not a correctness one.** Reaping, promotion, and cron
-claims are all compare-and-set at the broker — only the caller whose `ZREM` removed the member, or
-whose expected score still matched, goes on to act. N schedulers racing still fire each tick exactly
-once. The lease just stops fifty workers doing identical bookkeeping. That is why reaping and
-promotion run in *every* worker (cheap, latency-sensitive) while cron is gated on leadership
-(fan-out, less urgent).
+claims are all compare-and-set: only the caller whose `ZREM` removed the member, or whose expected
+score still matched, goes on to act. N schedulers racing still fire each tick exactly once. The lease
+just stops fifty workers doing identical bookkeeping — which is why reaping and promotion run in
+*every* worker while cron is gated on leadership.
 
 **Priority is a probability, not an ordering.** Queue order is reshuffled every poll in proportion to
-weights, so a queue weighted 6-of-10 is tried first about 60% of the time and no queue is ever
-starved outright. `StrictPriority` is available for workloads that genuinely want starvation, but you
-have to ask for it.
-
-**Three narrow interfaces instead of one wide one.** `Broker` (hot path), `Maintenance` (background
-loops), `CronStore` (scheduler). Split by consumer: a test double should not have to implement
-`Promote` in order to run a job.
-
----
-
-## What this deliberately does not do
-
-- **No exactly-once.** See the contract above.
-- **No Redis Cluster.** The delayed, retry, and dead-letter sets are global while ready and active
-  keys are per-queue, so scripts touching both span hash slots. Single-node and Sentinel only.
-  `rdb.New` takes a `redis.UniversalClient`, so Sentinel is a configuration change — but it is
-  untested here and should not be claimed otherwise.
-- **No multi-machine validation.** Workers are independent processes coordinating only through Redis,
-  and nothing assumes co-location, but every measurement above ran on one host.
-- **No metrics endpoint or CLI.** Structured logging via `log/slog` is throughout; Prometheus and a
-  Cobra CLI were scoped out.
-- **No DST handling in cron.** Schedules are computed in the caller's location, so a wall clock that
-  skips or repeats an hour will skip or repeat that day's fire. Run schedulers in UTC.
-- **Minute granularity for cron.** Five fields, as standard. `@every 30s` covers the sub-minute case.
-
----
+weights, so a queue weighted 6-of-10 leads about 60% of the time and nothing starves.
+`StrictPriority` is available for workloads that want starvation, but you have to ask for it.
 
 ## Demos
 
-Each is self-contained and prints what it proves.
-
 ```bash
-go run ./examples/lifecycle   # job lifecycle end to end, in memory, no dependencies
-go run ./examples/worker      # producer + worker pool + graceful drain (Ctrl-C to watch it)
+go run ./examples/lifecycle   # the job lifecycle end to end, in memory, no dependencies
+go run ./examples/worker      # producer, worker pool, retries, graceful drain (Ctrl-C to watch)
 go run ./examples/scheduled   # cron with leader election and a failover
 ```
 
-With a real Redis:
-
-```bash
-docker run -d -p 6379:6379 redis:7-alpine
-```
+With a real Redis — `docker run -d -p 6379:6379 redis:7-alpine`:
 
 ```bash
 REDIS_ADDR=localhost:6379 go run ./examples/chaos
@@ -242,10 +154,8 @@ REDIS_ADDR=localhost:6379 go run ./examples/chaos
 REDIS_ADDR=localhost:6379 go run ./examples/bench
 ```
 
-`worker` and `scheduled` also accept `REDIS_ADDR` and run the identical code against either broker,
-which is the `Broker` interface earning its keep.
-
----
+`worker` and `scheduled` accept `REDIS_ADDR` too and run identical code against either broker, which
+is the `Broker` interface earning its keep.
 
 ## Development
 
@@ -253,29 +163,28 @@ which is the `Broker` interface earning its keep.
 make check
 ```
 
-Runs build, vet, race tests, and lint — the gate every commit is held to.
+Build, vet, race tests, and lint — the gate every commit is held to.
 
 ```bash
 make test-integration
 ```
 
-The Redis-backed suite, behind a `//go:build integration` tag so the default `go test ./...` stays
-hermetic and fast (no Docker, no network). It provisions Redis itself via testcontainers.
-
-Requires Go 1.25+ and, for the integration suite, a running Docker daemon.
-
-### Layout
+The Redis suite, behind a `//go:build integration` tag so the default `go test ./...` stays hermetic
+and fast. It provisions Redis itself via testcontainers. Needs Go 1.25+ and a running Docker daemon.
 
 ```
 job.go broker.go errors.go       core types, the three interfaces, sentinel errors
-client.go handler.go server.go   producer API, handler registry, worker runtime
-cron.go queues.go backoff.go     scheduling, priority policy, retry policy
+client.go handler.go             producer API and handler registry
+server.go                        worker lifecycle: config, startup, shutdown
+worker.go                        claiming work, running handlers, tracking in-flight jobs
+maintenance.go                   lease renewal, orphan recovery, promotion, heartbeats
+scheduler.go cron.go             leader-elected cron
+queues.go backoff.go             priority and retry policy
 internal/rdb/                    Redis broker + 12 embedded Lua scripts
 internal/memory/                 in-process broker: tests, local dev, reference implementation
 internal/cron/                   five-field cron parser
-examples/                        five runnable demos
 ```
 
 The in-memory broker exists so the worker runtime, retry policy, and shutdown logic can be tested
-with no Docker and no network — and so the Redis broker has a reference implementation to be checked
+with no Docker and no network — and so the Redis broker has a reference implementation to check
 against.
