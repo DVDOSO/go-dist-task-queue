@@ -9,6 +9,7 @@ import (
 	"os"
 	"runtime/debug"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -40,6 +41,15 @@ const (
 	// large backlog cannot monopolise a Redis event loop.
 	reapBatch    = 100
 	promoteBatch = 100
+	cronBatch    = 100
+
+	// schedulerLease is the name of the lease that elects the cron scheduler.
+	schedulerLease = "scheduler"
+
+	// cronUniqueTTL is how long a fired tick's unique key is held. It only has
+	// to outlive a retry of the same tick; successive ticks get distinct keys
+	// because the fire time is part of the key.
+	cronUniqueTTL = 5 * time.Minute
 )
 
 // Config configures a [Server].
@@ -74,6 +84,17 @@ type Config struct {
 	// WorkerID identifies this process. Generated if empty.
 	WorkerID string
 
+	// Cron are recurring schedules this worker knows how to fire.
+	//
+	// Every worker should be given the same list. Only one of them fires a
+	// given tick: the schedulers elect a leader, and the claim is a
+	// compare-and-set on the broker regardless, so a brief overlap during
+	// failover cannot double-fire.
+	//
+	// Requires a broker implementing [CronStore]; NewServer fails otherwise
+	// rather than silently never running them.
+	Cron []CronEntry
+
 	// Logger defaults to slog.Default().
 	Logger *slog.Logger
 }
@@ -85,10 +106,18 @@ type Server struct {
 	// maint is non-nil when the broker also implements Maintenance, which is
 	// what enables orphan recovery, retry promotion, and heartbeats.
 	maint Maintenance
+	// cron is non-nil when the broker also implements CronStore.
+	cron CronStore
 
 	cfg  Config
 	log  *slog.Logger
 	host string
+
+	// entries holds the parsed schedules, keyed by entry ID.
+	entries map[string]*compiledEntry
+	// leader records whether this worker currently holds the scheduler lease,
+	// for logging and for tests to observe failover.
+	leader atomic.Bool
 
 	// mu guards inFlight, which maps a running job's ID to the cancel function
 	// for its individual context. Per-job cancellation is what lets a single
@@ -135,12 +164,27 @@ func NewServer(b Broker, cfg Config) (*Server, error) {
 		host = "unknown"
 	}
 
+	// Parse every schedule up front so a typo in a cron spec fails at startup
+	// rather than at 3am when the first tick would have fired.
+	entries := make(map[string]*compiledEntry, len(cfg.Cron))
+	for _, e := range cfg.Cron {
+		ce, err := compile(e)
+		if err != nil {
+			return nil, err
+		}
+		if _, dup := entries[ce.entry.ID]; dup {
+			return nil, fmt.Errorf("taskq: duplicate cron entry ID %q", ce.entry.ID)
+		}
+		entries[ce.entry.ID] = ce
+	}
+
 	s := &Server{
 		broker:   b,
 		cfg:      cfg,
 		log:      cfg.Logger.With(slog.String("worker_id", cfg.WorkerID)),
 		host:     host,
 		inFlight: make(map[string]context.CancelFunc),
+		entries:  entries,
 	}
 	// Optional rather than required: a broker that only implements the hot path
 	// is still usable, it just cannot recover orphans. Saying so at startup
@@ -148,8 +192,24 @@ func NewServer(b Broker, cfg Config) (*Server, error) {
 	if m, ok := b.(Maintenance); ok {
 		s.maint = m
 	}
+	if c, ok := b.(CronStore); ok {
+		s.cron = c
+	}
+	// Cron is different: asking for schedules and silently not running them is
+	// never what the caller meant, so this is an error rather than a warning.
+	if len(entries) > 0 {
+		if s.cron == nil {
+			return nil, errors.New("taskq: Config.Cron was set but the broker does not implement taskq.CronStore")
+		}
+		if s.maint == nil {
+			return nil, errors.New("taskq: Config.Cron requires a broker implementing taskq.Maintenance for leader election")
+		}
+	}
 	return s, nil
 }
+
+// IsLeader reports whether this worker currently holds the scheduler lease.
+func (s *Server) IsLeader() bool { return s.leader.Load() }
 
 // WorkerID returns this server's identity, which is also the owner stamped on
 // every job it claims.
@@ -236,6 +296,182 @@ func (s *Server) startMaintenance(runCtx, maintCtx context.Context, started time
 		defer wg.Done()
 		s.promoteLoop(runCtx)
 	}()
+
+	if len(s.entries) > 0 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			s.schedulerLoop(runCtx)
+		}()
+	}
+}
+
+// schedulerLoop elects a leader and fires due cron schedules.
+//
+// Election is an efficiency measure, not a correctness one. Every claim is a
+// compare-and-set at the broker, so N schedulers racing still fire each tick
+// exactly once; the lease simply stops fifty workers all doing the same
+// bookkeeping every few seconds. That is worth knowing when the lease lapses
+// and two schedulers briefly overlap: the answer is that nothing breaks.
+//
+// Unlike reaping and promotion, which every worker does unconditionally
+// because they are cheap and latency-sensitive, cron is a fan-out point where
+// redundant work is more wasteful and less urgent.
+func (s *Server) schedulerLoop(ctx context.Context) {
+	interval := min(5*time.Second, s.cfg.VisibilityTimeout/2)
+	if interval <= 0 {
+		interval = time.Second
+	}
+	// Three intervals, so one slow round trip does not trigger a needless
+	// leadership handover.
+	leaseTTL := 3 * interval
+
+	defer func() {
+		if !s.leader.Load() {
+			return
+		}
+		// Releasing on the way out makes failover immediate instead of
+		// TTL-delayed, which matters during a rolling deploy.
+		releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), reportTimeout)
+		defer cancel()
+		if err := s.maint.ReleaseLease(releaseCtx, schedulerLease, s.cfg.WorkerID); err != nil {
+			s.log.Error("releasing scheduler lease failed", slog.String("error", err.Error()))
+		}
+		s.leader.Store(false)
+	}()
+
+	if err := s.seedSchedules(ctx); err != nil {
+		s.log.Error("seeding cron schedules failed", slog.String("error", err.Error()))
+	}
+
+	for {
+		if !sleepCtx(ctx, interval) {
+			return
+		}
+
+		held, err := s.maint.AcquireLease(ctx, schedulerLease, s.cfg.WorkerID, leaseTTL)
+		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			s.log.Error("acquiring scheduler lease failed", slog.String("error", err.Error()))
+			continue
+		}
+
+		if was := s.leader.Swap(held); was != held {
+			if held {
+				s.log.Info("became scheduler leader")
+			} else {
+				s.log.Warn("lost scheduler leadership")
+			}
+		}
+		if !held {
+			continue
+		}
+
+		s.fireDueSchedules(ctx)
+	}
+}
+
+// seedSchedules records a first fire time for any schedule that does not have
+// one, leaving running schedules untouched.
+func (s *Server) seedSchedules(ctx context.Context) error {
+	now := time.Now()
+	for id, ce := range s.entries {
+		next := ce.schedule.Next(now)
+		if next.IsZero() {
+			s.log.Error("cron schedule can never fire",
+				slog.String("entry_id", id),
+				slog.String("spec", ce.entry.Spec))
+			continue
+		}
+		created, err := s.cron.ScheduleCronIfAbsent(ctx, id, next)
+		if err != nil {
+			return err
+		}
+		if created {
+			s.log.Info("cron schedule registered",
+				slog.String("entry_id", id),
+				slog.String("spec", ce.entry.Spec),
+				slog.Time("first_fire", next))
+		}
+	}
+	return nil
+}
+
+// fireDueSchedules materialises a job for each schedule whose tick has come up.
+func (s *Server) fireDueSchedules(ctx context.Context) {
+	due, err := s.cron.DueCron(ctx, cronBatch)
+	if err != nil {
+		if ctx.Err() == nil {
+			s.log.Error("reading due cron entries failed", slog.String("error", err.Error()))
+		}
+		return
+	}
+
+	for _, d := range due {
+		ce, known := s.entries[d.ID]
+		if !known {
+			// A schedule from a different build of the application. Leaving it
+			// alone is the only safe choice: deleting it would break whichever
+			// deploy does own it.
+			continue
+		}
+
+		// Advance from now rather than from the missed tick, so a scheduler
+		// that was down for an hour does not enqueue an hour of backlog the
+		// moment it returns. Missed ticks are skipped, not replayed.
+		base := time.Now()
+		if base.Before(d.FireAt) {
+			base = d.FireAt
+		}
+		next := ce.schedule.Next(base)
+		if next.IsZero() {
+			s.log.Error("cron schedule can never fire again",
+				slog.String("entry_id", d.ID),
+				slog.String("spec", ce.entry.Spec))
+			continue
+		}
+
+		// Enqueue first, then claim. If this worker dies in between, the next
+		// scheduler re-fires the same tick and the unique key collapses it --
+		// whereas claiming first and then failing to enqueue would silently
+		// skip the tick altogether.
+		job := &Job{
+			Queue:       ce.entry.Queue,
+			Type:        ce.entry.Type,
+			Payload:     ce.entry.Payload,
+			MaxAttempts: ce.entry.MaxAttempts,
+			UniqueKey:   cronUniqueKey(d.ID, d.FireAt),
+			UniqueTTL:   cronUniqueTTL,
+		}
+		if err := s.broker.Enqueue(ctx, job); err != nil && !errors.Is(err, ErrDuplicate) {
+			s.log.Error("enqueuing cron job failed",
+				slog.String("entry_id", d.ID),
+				slog.String("error", err.Error()))
+			// Deliberately not claiming, so the tick is retried next pass.
+			continue
+		}
+
+		won, err := s.cron.ClaimCron(ctx, d.ID, d.FireAt, next)
+		if err != nil {
+			s.log.Error("claiming cron tick failed",
+				slog.String("entry_id", d.ID),
+				slog.String("error", err.Error()))
+			continue
+		}
+		if !won {
+			// Another scheduler advanced this entry first. The unique key
+			// means only one job exists regardless.
+			continue
+		}
+
+		s.log.Info("cron job enqueued",
+			slog.String("entry_id", d.ID),
+			slog.String("type", ce.entry.Type),
+			slog.String("job_id", job.ID),
+			slog.Time("next_fire", next))
+	}
 }
 
 // renewLoop extends the leases of every in-flight job.
