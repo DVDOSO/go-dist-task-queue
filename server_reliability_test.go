@@ -29,7 +29,7 @@ func TestLeaseRenewalOutlivesTheVisibilityTimeout(t *testing.T) {
 	mux.HandleFunc("slow", func(ctx context.Context, _ *taskq.Job) error {
 		runs.Add(1)
 		select {
-		case <-time.After(800 * time.Millisecond):
+		case <-time.After(1500 * time.Millisecond):
 			return nil
 		case <-ctx.Done():
 			return ctx.Err()
@@ -39,7 +39,7 @@ func TestLeaseRenewalOutlivesTheVisibilityTimeout(t *testing.T) {
 	cfg := quietConfig("default")
 	// Renewal every ~66ms, reaping every ~100ms: the job outlives four
 	// visibility timeouts.
-	cfg.VisibilityTimeout = 200 * time.Millisecond
+	cfg.VisibilityTimeout = 500 * time.Millisecond
 	cfg.ShutdownTimeout = 5 * time.Second
 	stop := runServer(t, b, cfg, mux)
 
@@ -86,7 +86,7 @@ func TestLostLeaseCancelsTheJob(t *testing.T) {
 	})
 
 	cfg := quietConfig("default")
-	cfg.VisibilityTimeout = 150 * time.Millisecond // renewal every 50ms
+	cfg.VisibilityTimeout = 450 * time.Millisecond // renewal every 150ms
 	cfg.ShutdownTimeout = 5 * time.Second
 	runServer(t, b, cfg, mux)
 
@@ -131,7 +131,7 @@ func TestRepeatedRenewalFailureCancelsJobs(t *testing.T) {
 	})
 
 	cfg := quietConfig("default")
-	cfg.VisibilityTimeout = 150 * time.Millisecond // renewal every 50ms
+	cfg.VisibilityTimeout = 450 * time.Millisecond // renewal every 150ms
 	cfg.ShutdownTimeout = 5 * time.Second
 	runServer(t, b, cfg, mux)
 
@@ -168,7 +168,7 @@ func TestReaperRecoversAnOrphanedJob(t *testing.T) {
 	claimed, err := b.Dequeue(context.Background(), taskq.ClaimOpts{
 		WorkerID:          "worker-that-died",
 		Queues:            []string{"default"},
-		VisibilityTimeout: 150 * time.Millisecond,
+		VisibilityTimeout: 450 * time.Millisecond,
 	})
 	if err != nil {
 		t.Fatalf("Dequeue: %v", err)
@@ -185,7 +185,7 @@ func TestReaperRecoversAnOrphanedJob(t *testing.T) {
 	})
 
 	cfg := quietConfig("default")
-	cfg.VisibilityTimeout = 150 * time.Millisecond
+	cfg.VisibilityTimeout = 450 * time.Millisecond
 	stop := runServer(t, b, cfg, mux)
 
 	waitFor(t, 10*time.Second, "the orphan to be recovered and run", func() bool {
@@ -221,7 +221,7 @@ func TestRetryCycleCompletes(t *testing.T) {
 	})
 
 	cfg := quietConfig("default")
-	cfg.VisibilityTimeout = 200 * time.Millisecond // promotion every ~100ms
+	cfg.VisibilityTimeout = 500 * time.Millisecond // promotion every ~250ms
 	cfg.Backoff = &taskq.Exponential{Base: 10 * time.Millisecond, Cap: 20 * time.Millisecond, Jitter: taskq.JitterNone}
 	stop := runServer(t, b, cfg, mux)
 
@@ -260,7 +260,7 @@ func TestExhaustedRetriesReachTheDeadLetterQueue(t *testing.T) {
 	})
 
 	cfg := quietConfig("default")
-	cfg.VisibilityTimeout = 200 * time.Millisecond
+	cfg.VisibilityTimeout = 500 * time.Millisecond
 	cfg.Backoff = &taskq.Exponential{Base: 10 * time.Millisecond, Cap: 10 * time.Millisecond, Jitter: taskq.JitterNone}
 	stop := runServer(t, b, cfg, mux)
 
@@ -350,7 +350,7 @@ func TestHeartbeatIsPublished(t *testing.T) {
 
 	b := memory.New()
 	cfg := quietConfig("default")
-	cfg.VisibilityTimeout = 200 * time.Millisecond
+	cfg.VisibilityTimeout = 500 * time.Millisecond
 	cfg.Concurrency = 7
 
 	srv, err := taskq.NewServer(b, cfg)

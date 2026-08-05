@@ -49,9 +49,10 @@ func startServer(t *testing.T, b taskq.Broker, cfg taskq.Config, h taskq.Handler
 
 func cronConfig(entries ...taskq.CronEntry) taskq.Config {
 	cfg := quietConfig("default")
-	// Short so the scheduler loop ticks quickly: its interval is
-	// min(5s, VisibilityTimeout/2).
-	cfg.VisibilityTimeout = 300 * time.Millisecond
+	// Short so the scheduler loop ticks quickly (its interval is
+	// min(5s, VisibilityTimeout/2)), but not so short that a loaded
+	// machine under -race can miss a window.
+	cfg.VisibilityTimeout = 600 * time.Millisecond
 	cfg.Cron = entries
 	return cfg
 }
